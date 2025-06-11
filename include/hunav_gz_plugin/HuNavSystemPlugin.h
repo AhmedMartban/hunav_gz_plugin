@@ -81,6 +81,8 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 
+#include <mutex>
+
 // namespace gazebo_ros {
 
 
@@ -115,7 +117,21 @@ public:
   // void goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
 
 private:
+
+  //tf2 transform handling
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  // Reset handling
+  std::mutex update_mutex_;
+  bool updating_paused_ = false;
+  bool reset_requested_ = false;
+
+
+  //Reset Helper functions
+  void handleCompleteReset(gz::sim::EntityComponentManager& _ecm);
+  void deleteAllActorsFromECM(gz::sim::EntityComponentManager& _ecm);
+  void callResetAgentsService();
+  void triggerReset();
+  bool shouldSkipUpdate();
   /// Helper functions
   void initializeAgents(gz::sim::EntityComponentManager& _ecm);
   void initializeRobot(gz::sim::EntityComponentManager& _ecm);
@@ -130,6 +146,8 @@ private:
 
   void fixActorHeight(const hunav_msgs::msg::Agent& ag, gz::math::Pose3d& p);
 
+  void deleteAllActors(gz::sim::EntityComponentManager& _ecm);
+  void onResetTriggered();
   //Wall struct and helper functions/variables
   void loadWallData();
   struct WallSegment {

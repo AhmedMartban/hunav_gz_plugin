@@ -238,6 +238,11 @@ void HuNavSystemPluginIGN::Configure(const gz::sim::Entity& _entity, const std::
     return;
   }
   gzmsg << "Plugin HuNavPluginIGN configured!!!!!!!!!!!!!!!" << std::endl;
+
+  // Initialize safe reset system
+  updating_paused_ = false;
+  reset_requested_ = false;
+  gzmsg << "Safe reset system initialized" << std::endl;
 }
 
 
@@ -1455,25 +1460,26 @@ void HuNavSystemPluginIGN::updateGazeboPedestrians(gz::sim::EntityComponentManag
  */
 void HuNavSystemPluginIGN::PreUpdate(const gz::sim::UpdateInfo& _info, gz::sim::EntityComponentManager& _ecm)
 {
-  //(void)_info;
-  //(void)_ecm;
-  // std::string st;
-  // auto pose = _ecm.Component<gz::sim::components::Pose>(actorEntity_)->Data();
-  // //ignmsg << "Actor pose: " << pose << std::endl;
-  // _info.paused ? st = "Simulation paused": st = "Simulation running";
 
-  // _info.simTime;
-  // //ignmsg << st << std::endl;
-  // std_msgs::msg::String msg;
-  // msg.data = st;
-  // this->ros_test_pub_->publish(msg);
+  // SAFETY CHECK: Skip if during reset or no pedestrians
+  if (pedestrians_.empty()) {
+    if(!agentsInitialized_) {
+      try {
+        initializeAgents(_ecm);
+      } catch (const std::exception& e) {
+        // Silently continue if initialization fails during reset
+        return;
+      }
+    }
+    return;
+  }
 
-  //GZ_PROFILE("HuNavSystemPluginIGN::PreUpdate");
 
-  _ecm.Each<gz::sim::components::Name>([&](const gz::sim::Entity &entity, const gz::sim::components::Name *name) {
-    gzmsg << "Entity: " << entity << " Name: " << name->Data() << std::endl;
-    return true;
-});
+
+//   _ecm.Each<gz::sim::components::Name>([&](const gz::sim::Entity &entity, const gz::sim::components::Name *name) {
+//     gzmsg << "Entity: " << entity << " Name: " << name->Data() << std::endl;
+//     return true;
+// });
 
   counter_++;
 
@@ -1484,6 +1490,23 @@ void HuNavSystemPluginIGN::PreUpdate(const gz::sim::UpdateInfo& _info, gz::sim::
       counter_ = 0;
     }
     //lastUpdate_ = _info.simTime;
+    return;
+  }
+
+  // VALIDATE PEDESTRIANS before accessing them
+  auto it = pedestrians_.begin();
+  while (it != pedestrians_.end()) {
+    auto nameComp = _ecm.Component<gz::sim::components::Name>(it->first);
+    if (!nameComp) {
+      gzmsg << "Removing invalid pedestrian entity " << it->first << std::endl;
+      it = pedestrians_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // Skip if no valid pedestrians remain after cleanup
+  if (pedestrians_.empty()) {
     return;
   }
 
@@ -1607,7 +1630,125 @@ void HuNavSystemPluginIGN::PreUpdate(const gz::sim::UpdateInfo& _info, gz::sim::
   
 }
 
+bool HuNavSystemPluginIGN::shouldSkipUpdate()
+{
+  std::lock_guard<std::mutex> lock(update_mutex_);
+  return updating_paused_ || reset_requested_;
+}
 
+
+void HuNavSystemPluginIGN::triggerReset()
+{
+    std::lock_guard<std::mutex> lock(update_mutex_);
+    
+    gzmsg << "Reset triggered - pausing updates and marking for reset" << std::endl;
+    updating_paused_ = true;
+    reset_requested_ = true;
+    
+}
+
+void HuNavSystemPluginIGN::handleCompleteReset(gz::sim::EntityComponentManager& _ecm)
+{
+    gzmsg << "Starting complete reset process..." << std::endl;
+    
+    // Phase 1: Reset HuNav System first (clears agent data)
+    callResetAgentsService();
+    
+    // Phase 2: Delete all actors from ECM (removes from simulation)
+    deleteAllActorsFromECM(_ecm);
+    
+    // Phase 3: Reset plugin state
+    agentsInitialized_ = false;
+    
+    // Phase 4: Resume updates
+    updating_paused_ = false;
+    
+    gzmsg << "Complete reset finished - plugin ready for new agents" << std::endl;
+}
+
+void HuNavSystemPluginIGN::callResetAgentsService()
+{
+    if (!rosSrvResetClient_) {
+        gzwarn << "Reset agents service client not available" << std::endl;
+        return;
+    }
+    
+    try {
+        // Wait for service to be available
+        if (!rosSrvResetClient_->wait_for_service(std::chrono::seconds(2))) {
+            gzwarn << "Reset agents service not available within timeout" << std::endl;
+            return;
+        }
+        
+        // Create reset request
+        auto request = std::make_shared<hunav_msgs::srv::ResetAgents::Request>();
+        
+        // Add empty robot info
+        request->robot.id = 0;
+        request->robot.name = robotName_;
+        request->robot.type = hunav_msgs::msg::Agent::ROBOT;
+        
+        // Add empty agents list
+        request->current_agents.header.stamp = rosnode_->get_clock()->now();
+        request->current_agents.header.frame_id = "map";
+        // agents list is empty - this tells HuNav to reset
+        
+        gzmsg << "Calling HuNav reset service..." << std::endl;
+        
+        // Call service 
+        auto future = rosSrvResetClient_->async_send_request(request);
+        
+        // Wait for response with timeout
+        auto status = future.wait_for(std::chrono::seconds(2));
+        if (status == std::future_status::ready) {
+            auto response = future.get();
+            if (response && response->ok) {
+                gzmsg << "HuNav system reset successfully" << std::endl;
+            } else {
+                gzwarn << "HuNav system reset failed" << std::endl;
+            }
+        } else {
+            gzwarn << "HuNav reset service timeout" << std::endl;
+        }
+        
+    } catch (const std::exception& e) {
+        gzerr << "Error calling reset service: " << e.what() << std::endl;
+    }
+}
+
+void HuNavSystemPluginIGN::deleteAllActorsFromECM(gz::sim::EntityComponentManager& _ecm)
+{
+    gzmsg << "Deleting all pedestrian actors from ECM..." << std::endl;
+    
+    // Find and delete all actors (except robot and static models)
+    std::vector<gz::sim::Entity> actorsToDelete;
+    
+    _ecm.Each<gz::sim::components::Actor, gz::sim::components::Name>(
+        [&](const gz::sim::Entity& entity, 
+            const gz::sim::components::Actor* /*actorComp*/,
+            const gz::sim::components::Name* nameComp) -> bool
+        {
+            const std::string& actorName = nameComp->Data();
+            
+            // Only delete pedestrian actors, skip robot and infrastructure
+            if (actorName != robotName_ && 
+                actorName != "ground_plane" &&
+                actorName.find("wall") == std::string::npos) 
+            {
+                actorsToDelete.push_back(entity);
+                gzmsg << "Marking actor for deletion: " << actorName << std::endl;
+            }
+            
+            return true; // Continue iteration
+        });
+    
+    // Delete all marked actors
+    for (const auto& entity : actorsToDelete) {
+        _ecm.RequestRemoveEntity(entity);
+    }
+    
+    gzmsg << "Marked " << actorsToDelete.size() << " actors for deletion from ECM" << std::endl;
+}
 
 
 GZ_ADD_PLUGIN(HuNavSystemPluginIGN, gz::sim::System, HuNavSystemPluginIGN::ISystemConfigure, HuNavSystemPluginIGN::ISystemPreUpdate/*, HuNavPluginIGN::ISystemPostUpdate, HuNavPluginIGN::ISystemReset*/)
